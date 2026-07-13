@@ -41,16 +41,20 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
-uint8_t gpsInt;
-uint8_t gpsIntIndex = 0;
-uint8_t gpsLine[64];
+uint8_t gps_dma_buffer[128];
+uint16_t received_pack_size = 0;
+uint8_t line[128];
+volatile uint8_t is_pack_ready = 0;
+uint16_t old_pos = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -90,9 +94,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart1, &gpsInt, 1);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, gps_dma_buffer, 128);
 
   /* USER CODE END 2 */
 
@@ -103,6 +108,33 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  if(is_pack_ready){
+	  		  is_pack_ready = 0;
+
+	  		  static uint8_t line_index = 0;
+
+	  		  while (old_pos != received_pack_size){
+
+	  			  uint8_t data = gps_dma_buffer[old_pos];
+
+	  			  if (line_index < 127) {
+	  				  line[line_index++] = data;
+	  			  }
+
+	  			  if (data == '\n') {
+	  				  line[line_index] = '\0';
+
+	  				  memset(line, 0, sizeof(line));
+	  				  line_index = 0;
+	  			  }
+
+	  			  old_pos++;
+	  			  if (old_pos >= 128) {
+	  				  old_pos = 0;
+	  			  }
+	  		  }
+	  	  }
+
   }
   /* USER CODE END 3 */
 }
@@ -182,6 +214,22 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -201,19 +249,12 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-
 	if(huart->Instance == USART1){
-		gpsLine[gpsIntIndex] = gpsInt;
-		gpsIntIndex++;
+		received_pack_size = Size;
 
-		if(gpsInt == '\n'){
-			gpsIntIndex = 0;
-			memset(gpsLine, 0, sizeof(gpsLine));
-		}
-
-		HAL_UART_Receive_IT(&huart1, &gpsInt, 1);
+		is_pack_ready = 1;
 	}
 }
 
