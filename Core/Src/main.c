@@ -43,8 +43,9 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint8_t data;
-uint8_t line[256];
+uint8_t gpsInt;
+uint8_t gpsIntIndex = 0;
+uint8_t gpsLine[64];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -91,29 +92,17 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &gpsInt, 1);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  int index = 0;
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  HAL_StatusTypeDef uartStatus = HAL_UART_Receive(&huart1, &data, 1, HAL_MAX_DELAY);
-
-	  	  if(uartStatus == HAL_OK){
-
-	  		  if(data == '\n'){
-	  			  index = 0;
-	  			  memset(line, 0, sizeof(line));
-	  		  }
-
-	  		  line[index] = data;
-	  		  index++;
-	  	  }
   }
   /* USER CODE END 3 */
 }
@@ -212,6 +201,21 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+
+	if(huart->Instance == USART1){
+		gpsLine[gpsIntIndex] = gpsInt;
+		gpsIntIndex++;
+
+		if(gpsInt == '\n'){
+			gpsIntIndex = 0;
+			memset(gpsLine, 0, sizeof(gpsLine));
+		}
+
+		HAL_UART_Receive_IT(&huart1, &gpsInt, 1);
+	}
+}
 
 /* USER CODE END 4 */
 
