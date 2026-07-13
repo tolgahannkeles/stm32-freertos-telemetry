@@ -18,10 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,12 +45,39 @@
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for gpsTask */
+osThreadId_t gpsTaskHandle;
+const osThreadAttr_t gpsTask_attributes = {
+  .name = "gpsTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
-uint8_t gps_dma_buffer[128];
+#define GPS_BUFFER_SIZE 512
+#define GPS_LINE_SIZE 128
+
+uint8_t gps_dma_buffer[GPS_BUFFER_SIZE];
 uint16_t received_pack_size = 0;
-uint8_t line[128];
-volatile uint8_t is_pack_ready = 0;
+uint8_t line[GPS_LINE_SIZE];
 uint16_t old_pos = 0;
+
+typedef struct {
+	double latitude;
+	double longitude;
+	float speed_kmh;
+	uint32_t timestamp;
+	uint8_t satellite_count;
+	uint8_t is_valid;
+} GPS_Data_t;
+
+GPS_Data_t gps_data;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,6 +85,9 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
+void StartDefaultTask(void *argument);
+void StartGPSTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -97,9 +129,47 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, gps_dma_buffer, 128);
 
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of gpsTask */
+  gpsTaskHandle = osThreadNew(StartGPSTask, NULL, &gpsTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -108,33 +178,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if(is_pack_ready){
-	  		  is_pack_ready = 0;
-
-	  		  static uint8_t line_index = 0;
-
-	  		  while (old_pos != received_pack_size){
-
-	  			  uint8_t data = gps_dma_buffer[old_pos];
-
-	  			  if (line_index < 127) {
-	  				  line[line_index++] = data;
-	  			  }
-
-	  			  if (data == '\n') {
-	  				  line[line_index] = '\0';
-
-	  				  memset(line, 0, sizeof(line));
-	  				  line_index = 0;
-	  			  }
-
-	  			  old_pos++;
-	  			  if (old_pos >= 128) {
-	  				  old_pos = 0;
-	  			  }
-	  		  }
-	  	  }
-
   }
   /* USER CODE END 3 */
 }
@@ -224,7 +267,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA2_Stream2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
 
 }
@@ -249,16 +292,165 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
-{
-	if(huart->Instance == USART1){
-		received_pack_size = Size;
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+	if (huart->Instance == USART1) {
+		if (__HAL_UART_GET_FLAG(huart, UART_FLAG_ORE)) {
+		            __HAL_UART_CLEAR_OREFLAG(huart);
+		            HAL_UART_DMAStop(huart);
+		            old_pos = 0;
+		            HAL_UARTEx_ReceiveToIdle_DMA(huart, gps_dma_buffer, GPS_BUFFER_SIZE);
+		            return;
+		        }
 
-		is_pack_ready = 1;
+		received_pack_size = Size;
+		osThreadFlagsSet(gpsTaskHandle, 0x0001);
+	}
+}
+
+void Format_NMEA_Sentence(char *dest, char *src) {
+	int i = 0;
+	int j = 0;
+
+	while (src[i] != '\0') {
+		dest[j++] = src[i];
+
+		if (src[i] == ',' && src[i + 1] == ',') {
+			dest[j++] = '0';
+		}
+		i++;
+	}
+	dest[j] = '\0';
+}
+
+void Parse_GPS_RMC(char *nmea_sentence) {
+	char formatted[128];
+	Format_NMEA_Sentence(formatted, nmea_sentence);
+
+	char msg_id[10] = { 0 };
+	char utc_time[20] = { 0 };
+	char status = 'V';
+	double raw_lat = 0.0, raw_lon = 0.0;
+	char lat_dir = 'N', lon_dir = 'E';
+	float speed_knots = 0.0;
+
+	int parsed = sscanf(formatted, "$%[^,],%[^,],%c,%lf,%c,%lf,%c,%f", msg_id,
+			utc_time, &status, &raw_lat, &lat_dir, &raw_lon, &lon_dir,
+			&speed_knots);
+
+	if (parsed >= 8 && status == 'A') {
+		int lat_degrees = (int) (raw_lat / 100);
+		double lat_minutes = raw_lat - (lat_degrees * 100);
+		gps_data.latitude = lat_degrees + (lat_minutes / 60.0);
+		if (lat_dir == 'S')
+			gps_data.latitude = -gps_data.latitude;
+
+		int lon_degrees = (int) (raw_lon / 100);
+		double lon_minutes = raw_lon - (lon_degrees * 100);
+		gps_data.longitude = lon_degrees + (lon_minutes / 60.0);
+		if (lon_dir == 'W')
+			gps_data.longitude = -gps_data.longitude;
+
+		gps_data.speed_kmh = speed_knots * 1.852f;
+		gps_data.timestamp = osKernelGetTickCount();
+		gps_data.is_valid = 1;
+	} else {
+		gps_data.is_valid = 0;
+	}
+}
+
+void Parse_GPS_GGA(char *nmea_sentence) {
+	char formatted[128];
+	Format_NMEA_Sentence(formatted, nmea_sentence);
+
+	char msg_id[10] = { 0 };
+	char utc_time[20] = { 0 };
+	double dummy_lat = 0.0, dummy_lon = 0.0;
+	char dummy_char1 = 'N', dummy_char2 = 'E';
+	int fix_quality = 0;
+	int satellites = 0;
+
+	int parsed = sscanf(formatted, "$%[^,],%[^,],%lf,%c,%lf,%c,%d,%d", msg_id,
+			utc_time, &dummy_lat, &dummy_char1, &dummy_lon, &dummy_char2,
+			&fix_quality, &satellites);
+
+	if (parsed >= 8) {
+		gps_data.satellite_count = (uint8_t) satellites;
 	}
 }
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartGPSTask */
+/**
+* @brief Function implementing the gpsTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartGPSTask */
+void StartGPSTask(void *argument)
+{
+  /* USER CODE BEGIN StartGPSTask */
+  /* Infinite loop */
+	static uint8_t line_index = 0;
+		uint16_t local_pack_size = 0;
+
+		HAL_UARTEx_ReceiveToIdle_DMA(&huart1, gps_dma_buffer, GPS_BUFFER_SIZE);
+
+		while (1) {
+			osThreadFlagsWait(0x0001, osFlagsWaitAny, osWaitForever);
+
+			local_pack_size = received_pack_size;
+
+			while (old_pos != local_pack_size) {
+				uint8_t data = gps_dma_buffer[old_pos];
+
+				if (data == '\n') {
+					line[line_index] = '\0';
+
+					if (line[0] == '$' && line_index > 6) {
+
+						if (line[3] == 'R' && line[4] == 'M' && line[5] == 'C') {
+							Parse_GPS_RMC((char*) line);
+						} else if (line[3] == 'G' && line[4] == 'G'
+								&& line[5] == 'A') {
+							Parse_GPS_GGA((char*) line);
+						}
+
+					}
+					line_index = 0;
+				} else if (data != '\r' && data >= 32 && data <= 126) {
+					if (line_index < 127) {
+						line[line_index++] = data;
+					}
+				}
+
+				old_pos++;
+				if (old_pos >= GPS_BUFFER_SIZE) {
+					old_pos = 0;
+				}
+			}
+		}
+
+  /* USER CODE END StartGPSTask */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
