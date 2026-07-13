@@ -1,0 +1,16 @@
+# STM32CubeIDE ve GCC derleme çıktıları
+Debug/
+Release/
+*.elf
+*.map
+*.hex
+*.bin
+*.list
+*.o
+*.d
+*.su
+*.cyclomatic
+
+# Eclipse / CubeIDE ayar dosyaları (Yerel ayarlar)
+.settings/
+.launches/
