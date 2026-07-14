@@ -256,7 +256,7 @@ static void MX_I2C1_Init(void) {
 
 	/* USER CODE END I2C1_Init 1 */
 	hi2c1.Instance = I2C1;
-	hi2c1.Init.ClockSpeed = 100000;
+	hi2c1.Init.ClockSpeed = 400000;
 	hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
 	hi2c1.Init.OwnAddress1 = 0;
 	hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -325,6 +325,7 @@ static void MX_DMA_Init(void) {
  * @retval None
  */
 static void MX_GPIO_Init(void) {
+	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
 	/* USER CODE BEGIN MX_GPIO_Init_1 */
 
 	/* USER CODE END MX_GPIO_Init_1 */
@@ -332,6 +333,26 @@ static void MX_GPIO_Init(void) {
 	/* GPIO Ports Clock Enable */
 	__HAL_RCC_GPIOA_CLK_ENABLE();
 	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+
+	/*Configure GPIO pin : PA5 */
+	GPIO_InitStruct.Pin = GPIO_PIN_5;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+	/*Configure GPIO pin : PA6 */
+	GPIO_InitStruct.Pin = GPIO_PIN_6;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+	/* EXTI interrupt init*/
+	HAL_NVIC_SetPriority(EXTI9_5_IRQn, 6, 0);
+	HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
 	/* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -346,12 +367,18 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
 			HAL_UART_DMAStop(huart);
 			old_pos = 0;
 			HAL_UARTEx_ReceiveToIdle_DMA(huart, gps_dma_buffer,
-					GPS_BUFFER_SIZE);
+			GPS_BUFFER_SIZE);
 			return;
 		}
 
 		received_pack_size = Size;
 		osThreadFlagsSet(gpsTaskHandle, 0x0001);
+	}
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	if (GPIO_Pin == GPIO_PIN_6) {
+		osThreadFlagsSet(imuTaskHandle, 0x0002);
 	}
 }
 
@@ -431,11 +458,18 @@ void Parse_GPS_GGA(char *nmea_sentence) {
 void MPU6050_Init(void) {
 	uint8_t check_val = 0;
 	uint8_t wake_data = 0x00;
+	uint8_t int_en_data = 0x01;
+	uint8_t rate_div = 0x09;
 
 	HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x75, 1, &check_val, 1, 100);
 
 	if (check_val == 0x68) {
 		HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x6B, 1, &wake_data, 1, 100);
+
+		HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x19, 1, &rate_div, 1, 100);
+
+		HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x38, 1, &int_en_data, 1, 100);
+
 		imu_data.is_connected = 1;
 	} else {
 		imu_data.is_connected = 0;
@@ -448,8 +482,10 @@ void MPU6050_Read_All(void) {
 	if (!imu_data.is_connected)
 		return;
 
-	if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3B, 1, raw_buffer, 14, 100)
-			== HAL_OK) {
+	HAL_StatusTypeDef mem_read_result = HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR,
+			0x3B, 1, raw_buffer, 14, 100);
+
+	if (mem_read_result == HAL_OK) {
 
 		int16_t raw_acc_x = (int16_t) ((raw_buffer[0] << 8) | raw_buffer[1]);
 		int16_t raw_acc_y = (int16_t) ((raw_buffer[2] << 8) | raw_buffer[3]);
@@ -483,7 +519,8 @@ void StartDefaultTask(void *argument) {
 	/* USER CODE BEGIN 5 */
 	/* Infinite loop */
 	for (;;) {
-		osDelay(1);
+		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+		osDelay(500);
 	}
 	/* USER CODE END 5 */
 }
@@ -550,13 +587,28 @@ void StartGPSTask(void *argument) {
 /* USER CODE END Header_StartIMUTask */
 void StartIMUTask(void *argument) {
 	/* USER CODE BEGIN StartIMUTask */
+	HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+
+	osDelay(100);
+
 	MPU6050_Init();
 
+	uint8_t dummy_status = 0;
+
+	if (imu_data.is_connected) {
+
+		HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3A, 1, &dummy_status, 1, 100);
+
+		HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+	}
+
 	/* Infinite loop */
-	for (;;) {
+	while (1) {
+		osThreadFlagsWait(0x0002, osFlagsWaitAny, osWaitForever);
+
 		MPU6050_Read_All();
 
-		osDelay(20);
+		HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3A, 1, &dummy_status, 1, 5);
 	}
 	/* USER CODE END StartIMUTask */
 }
