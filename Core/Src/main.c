@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -83,13 +84,25 @@ GPS_Data_t gps_data;
 
 // IMU
 #define MPU6050_ADDR (0x68 << 1)
+#define RAD_TO_DEG 57.295779513f
+
+float pitch_offset = 0.0f;
+float roll_offset = 0.0f;
+float gyro_x_offset = 0.0f;
+float gyro_y_offset = 0.0f;
+float gyro_z_offset = 0.0f;
 
 typedef struct {
 	float acc_x, acc_y, acc_z;
 	float gyro_x, gyro_y, gyro_z;
 	float temperature;
 
+	float pitch;
+	float roll;
+	float yaw;
+
 	uint8_t is_connected;
+	uint8_t is_calibrated;
 } IMU_Data_t;
 
 IMU_Data_t imu_data;
@@ -506,6 +519,37 @@ void MPU6050_Read_All(void) {
 		imu_data.temperature = ((float) raw_temp / 340.0f) + 36.53f;
 	}
 }
+
+void MPU6050_Complementary_Filter(void) {
+	if (!imu_data.is_connected)
+		return;
+
+	// 1. İvmeölçer ham statik açılarını hesapla
+	float acc_pitch = atan2f(imu_data.acc_x,
+			sqrtf(
+					imu_data.acc_y * imu_data.acc_y
+							+ imu_data.acc_z * imu_data.acc_z)) * RAD_TO_DEG;
+	float acc_roll = atan2f(imu_data.acc_y, imu_data.acc_z) * RAD_TO_DEG;
+
+	// 2. Jiroskop verilerinden kalibrasyon ofsetlerini çıkar
+	float gyro_y_calibrated = imu_data.gyro_y - gyro_y_offset;
+	float gyro_x_calibrated = imu_data.gyro_x - gyro_x_offset;
+	float gyro_z_calibrated = imu_data.gyro_z - gyro_z_offset;
+
+	// 3. Kalibrasyon bittiyse ivme açılarından ofsetleri düş (Geri besleme döngüsünün dışında güvenli sıfırlama)
+	if (imu_data.is_calibrated) {
+		acc_pitch -= pitch_offset;
+		acc_roll -= roll_offset;
+	}
+
+	// 4. Agresif ve Hızlı Tümleyici Filtre (0.90 / 0.10 Oranı)
+	// Not: Eğer kartı eğdiğinde açılar ters yöne gidiyorsa, aşağıdaki '+' işaretlerini '-' yapabilirsin.
+	imu_data.pitch = 0.90f * (imu_data.pitch + (gyro_y_calibrated * 0.01f))
+			+ 0.10f * acc_pitch;
+	imu_data.roll = 0.90f * (imu_data.roll + (gyro_x_calibrated * 0.01f))
+			+ 0.10f * acc_roll;
+	imu_data.yaw += gyro_z_calibrated * 0.01f;
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -588,26 +632,60 @@ void StartGPSTask(void *argument) {
 void StartIMUTask(void *argument) {
 	/* USER CODE BEGIN StartIMUTask */
 	HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-
 	osDelay(100);
-
 	MPU6050_Init();
 
-	uint8_t dummy_status = 0;
-
 	if (imu_data.is_connected) {
-
+		uint8_t dummy_status = 0;
 		HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3A, 1, &dummy_status, 1, 100);
-
 		HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 	}
 
+	// OTOMATİK KALİBRASYON (Hem Açı hem Gyro)
+	if (imu_data.is_connected) {
+		float pitch_sum = 0.0f;
+		float roll_sum = 0.0f;
+		float gyro_x_sum = 0.0f;
+		float gyro_y_sum = 0.0f;
+		float gyro_z_sum = 0.0f; // 🚨 Yeni
+		const int cal_samples = 100;
+
+		for (int i = 0; i < cal_samples; i++) {
+			osThreadFlagsWait(0x0002, osFlagsWaitAny, osWaitForever);
+			MPU6050_Read_All();
+			MPU6050_Complementary_Filter();
+
+			pitch_sum += imu_data.pitch;
+			roll_sum += imu_data.roll;
+			gyro_x_sum += imu_data.gyro_x;
+			gyro_y_sum += imu_data.gyro_y;
+			gyro_z_sum += imu_data.gyro_z; // 🚨 Yeni
+
+			uint8_t dummy_status = 0;
+			HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3A, 1, &dummy_status, 1,
+					5);
+		}
+
+		pitch_offset = pitch_sum / (float) cal_samples;
+		roll_offset = roll_sum / (float) cal_samples;
+		gyro_x_offset = gyro_x_sum / (float) cal_samples;
+		gyro_y_offset = gyro_y_sum / (float) cal_samples;
+		gyro_z_offset = gyro_z_sum / (float) cal_samples; // 🚨 Yeni
+
+		// Başlangıçta Yaw açısını sıfır kabul ediyoruz
+		imu_data.yaw = 0.0f;
+
+		imu_data.is_calibrated = 1;
+	}
+
 	/* Infinite loop */
-	while (1) {
+	for (;;) {
 		osThreadFlagsWait(0x0002, osFlagsWaitAny, osWaitForever);
 
 		MPU6050_Read_All();
+		MPU6050_Complementary_Filter();
 
+		uint8_t dummy_status = 0;
 		HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3A, 1, &dummy_status, 1, 5);
 	}
 	/* USER CODE END StartIMUTask */
